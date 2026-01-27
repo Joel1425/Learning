@@ -1,0 +1,223 @@
+# Data Flow Diagrams
+# Use for explaining write and read paths in interviews
+
+================================================================================
+                                  WRITE PATH
+================================================================================
+
+Step-by-step flow when a workspace is created:
+
+    ┌──────────┐
+    │  Client  │
+    └────┬─────┘
+         │
+    1. POST /v1/users/{userId}/workspaces
+         │
+         ▼
+    ┌──────────────┐
+    │ API Gateway  │  ─── Auth, rate limit ───▶
+    └──────┬───────┘
+           │
+    2. Forward to backend
+           │
+           ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │                        A4C SERVICE                           │
+    │                                                              │
+    │  ┌─────────────────────────────────────────────────────────┐│
+    │  │  @Transactional                                         ││
+    │  │  createWorkspace(request) {                             ││
+    │  │                                                         ││
+    │  │    3. workspace = workspaceRepo.save(new Workspace());  ││
+    │  │                                                         ││
+    │  │    4. job = new Job(SCHEDULED, WORKSPACE_CREATE);       ││
+    │  │       jobRepo.save(job);                                ││
+    │  │                                                         ││
+    │  │    5. eventPublisher.publish(JobCreatedEvent);          ││
+    │  │       // After commit!                                  ││
+    │  │                                                         ││
+    │  │    return workspace;                                    ││
+    │  │  }                                                      ││
+    │  └─────────────────────────────────────────────────────────┘│
+    │                           │                                  │
+    └───────────────────────────┼──────────────────────────────────┘
+                                │
+                  ┌─────────────┴─────────────┐
+                  │                           │
+           3,4. DB Write               5. After Commit
+                  │                           │
+                  ▼                           ▼
+           ┌────────────┐              ┌────────────┐
+           │ PostgreSQL │              │   Kafka    │
+           │            │              │            │
+           │ INSERT     │              │ job-sync   │
+           │ workspace  │              │ topic      │
+           │            │              │            │
+           │ INSERT     │              │ Message:   │
+           │ job        │              │ {jobId,    │
+           │            │              │  action:   │
+           │ COMMIT     │              │  INDEX}    │
+           └────────────┘              └─────┬──────┘
+                  │                          │
+                  │                   6. Consumer picks up
+                  │                          │
+                  ▼                          ▼
+           ┌────────────┐              ┌────────────┐
+           │  Response  │              │ ES Sync    │
+           │  to Client │              │ Consumer   │
+           │  (201)     │              │            │
+           └────────────┘              └─────┬──────┘
+                                             │
+                                      7. Fetch from DB
+                                             │
+                  ┌──────────────────────────┘
+                  │
+                  ▼
+           ┌────────────┐
+           │ PostgreSQL │ ◀─── Get latest job state
+           └─────┬──────┘
+                 │
+                 │ 8. Transform & Index
+                 ▼
+           ┌────────────┐
+           │Elasticsearch│
+           │            │
+           │ Index doc  │
+           │ to "jobs"  │
+           └────────────┘
+
+
+================================================================================
+                                  READ PATH
+================================================================================
+
+Step-by-step flow when user queries dashboard:
+
+    ┌──────────┐
+    │  Client  │
+    │Dashboard │
+    └────┬─────┘
+         │
+    1. POST /api/v1/jobs/search
+       {statuses: [FAILED], project: "backend-api"}
+         │
+         ▼
+    ┌──────────────┐
+    │ API Gateway  │
+    └──────┬───────┘
+           │
+    2. Forward to backend
+           │
+           ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │                        A4C SERVICE                           │
+    │                                                              │
+    │  ┌─────────────────────────────────────────────────────────┐│
+    │  │  search(request) {                                      ││
+    │  │    try {                                                ││
+    │  │      3. return searchElasticsearch(request);            ││
+    │  │    } catch (Exception e) {                              ││
+    │  │      4. return searchPostgres(request); // Fallback     ││
+    │  │    }                                                    ││
+    │  │  }                                                      ││
+    │  └─────────────────────────────────────────────────────────┘│
+    │                           │                                  │
+    └───────────────────────────┼──────────────────────────────────┘
+                                │
+                         3. ES Query
+                                │
+                                ▼
+                         ┌────────────────────────────────────────┐
+                         │            ELASTICSEARCH               │
+                         │                                        │
+                         │   Query:                               │
+                         │   {                                    │
+                         │     "bool": {                          │
+                         │       "filter": [                      │
+                         │         {"term": {"status": "FAILED"}},│
+                         │         {"term": {"projectName": ...}} │
+                         │       ]                                │
+                         │     }                                  │
+                         │   }                                    │
+                         │                                        │
+                         │   ┌───────┐  ┌───────┐  ┌───────┐     │
+                         │   │Shard 0│  │Shard 1│  │Shard 2│     │
+                         │   │  ↓    │  │  ↓    │  │  ↓    │     │
+                         │   │Query  │  │Query  │  │Query  │     │
+                         │   │  ↓    │  │  ↓    │  │  ↓    │     │
+                         │   │Top 20 │  │Top 20 │  │Top 20 │     │
+                         │   └───┬───┘  └───┬───┘  └───┬───┘     │
+                         │       └──────────┼──────────┘         │
+                         │                  ▼                    │
+                         │           Merge & Sort                │
+                         │           Return Top 20               │
+                         └────────────────────┬───────────────────┘
+                                              │
+                                       5. ES Response
+                                              │
+                                              ▼
+                         ┌────────────────────────────────────────┐
+                         │            A4C SERVICE                 │
+                         │                                        │
+                         │   Map ES hits to DTOs                  │
+                         │   Build pagination cursor              │
+                         └────────────────────┬───────────────────┘
+                                              │
+                                       6. Response
+                                              │
+                                              ▼
+                                       ┌────────────┐
+                                       │   Client   │
+                                       │            │
+                                       │ {          │
+                                       │   total: 45│
+                                       │   hits: [] │
+                                       │   next: [] │
+                                       │ }          │
+                                       └────────────┘
+
+
+================================================================================
+                              FALLBACK PATH (ES DOWN)
+================================================================================
+
+    A4C Service
+         │
+         │ ES query fails
+         │
+         ▼
+    ┌────────────┐     ┌────────────┐
+    │ Circuit    │────▶│ PostgreSQL │
+    │ Breaker    │     │  Replica   │
+    │ Opens      │     │            │
+    └────────────┘     │ SELECT *   │
+                       │ FROM job   │
+                       │ WHERE ...  │
+                       │ (slower)   │
+                       └─────┬──────┘
+                             │
+                             ▼
+                       Response to client
+                       (Degraded but functional)
+
+
+================================================================================
+                         KEY INTERVIEW POINTS
+================================================================================
+
+WRITE PATH:
+1. Database write BEFORE event publishing
+2. Event published AFTER COMMIT (TransactionalEventListener)
+3. Consumer FETCHES from DB (not event payload)
+4. This ensures consistency - ES always gets latest state
+
+READ PATH:
+1. Primary path through Elasticsearch
+2. Fallback to PostgreSQL if ES fails
+3. Filter context for caching
+4. Cursor-based pagination (search_after)
+
+LATENCY:
+- Write: ~50ms (DB only, sync is async)
+- Read: ~40-80ms (ES)
+- Fallback: ~200-500ms (PostgreSQL)

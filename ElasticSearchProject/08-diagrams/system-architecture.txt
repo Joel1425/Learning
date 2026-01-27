@@ -1,0 +1,135 @@
+# System Architecture Diagram
+# Use this for whiteboard interviews
+
+================================================================================
+                              COMPLETE SYSTEM ARCHITECTURE
+================================================================================
+
+                                    ┌─────────────────┐
+                                    │   Client/User   │
+                                    │     (CLI)       │
+                                    └────────┬────────┘
+                                             │
+                                    REST API Calls
+                                             │
+                                             ▼
+                    ┌────────────────────────────────────────────┐
+                    │           AWS API Gateway + LB             │
+                    │   • Rate limiting  • Auth  • Routing       │
+                    └────────────────────────┬───────────────────┘
+                                             │
+              ┌──────────────────────────────┼──────────────────────────────┐
+              │                              │                              │
+              ▼                              ▼                              ▼
+       ┌────────────┐                 ┌────────────┐                 ┌────────────┐
+       │A4C Service │                 │A4C Service │                 │A4C Service │
+       │ Instance 1 │                 │ Instance 2 │                 │ Instance 3 │
+       └─────┬──────┘                 └─────┬──────┘                 └─────┬──────┘
+             │                              │                              │
+             └──────────────────────────────┼──────────────────────────────┘
+                                            │
+                    ┌───────────────────────┴───────────────────────┐
+                    │                       │                       │
+                    ▼                       ▼                       ▼
+             ┌────────────┐          ┌────────────┐          ┌─────────────┐
+             │ PostgreSQL │          │    Kafka   │          │Elasticsearch│
+             │  Primary   │          │   Broker   │          │   Cluster   │
+             │            │          │            │          │             │
+             │ • Source   │          │ • job-sync │          │ • Index:    │
+             │   of truth │          │   topic    │          │   jobs      │
+             │ • ACID     │          │            │          │ • 3 nodes   │
+             └─────┬──────┘          └─────┬──────┘          └─────────────┘
+                   │                       │                        ▲
+                   │ WAL                   │                        │
+                   │                       ▼                        │
+             ┌─────┴──────┐          ┌────────────┐                 │
+             │  Replicas  │          │ ES Sync    │─────────────────┘
+             │ (R1, R2)   │          │ Consumer   │
+             └────────────┘          └────────────┘
+                                            │
+                                            │ (backup)
+                                            ▼
+                                     ┌────────────┐
+                                     │  Poller    │
+                                     │ (catches   │
+                                     │  missed)   │
+                                     └────────────┘
+
+
+================================================================================
+                              SIMPLIFIED VIEW (For Quick Sketching)
+================================================================================
+
+    Client ──▶ API Gateway ──▶ A4C Service ──┬──▶ PostgreSQL (writes)
+                                             │
+                                             ├──▶ Elasticsearch (reads)
+                                             │         ▲
+                                             │         │
+                                             └──▶ Kafka ─▶ ES Sync Consumer
+
+
+================================================================================
+                                 KEY POINTS TO MENTION
+================================================================================
+
+1. PostgreSQL is SOURCE OF TRUTH
+   - All writes go here first
+   - ACID transactions
+   - Replicas for read scaling and failover
+
+2. Elasticsearch for READ QUERIES
+   - Dashboard filtering
+   - Complex AND/OR queries
+   - Full-text search
+
+3. Kafka DECOUPLES sync
+   - A4C doesn't wait for ES
+   - Retry on failure
+   - Order preserved per partition
+
+4. Multiple A4C instances
+   - Stateless
+   - Behind load balancer
+   - Kubernetes managed
+
+5. ES Sync Consumer
+   - Consumes from Kafka
+   - Fetches latest from PostgreSQL
+   - Indexes to ES
+   - Idempotent
+
+6. Backup Poller
+   - Catches missed messages
+   - Runs every 30 seconds
+   - Ensures eventual sync
+
+
+================================================================================
+                               BARE METAL CLUSTER (Additional)
+================================================================================
+
+         A4C Service
+              │
+              │ SSH + Docker API
+              ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │                  BARE METAL CLUSTER                     │
+    │                                                         │
+    │   ┌───────────────┐         ┌───────────────┐          │
+    │   │   Server 1    │         │   Server 2    │          │
+    │   │               │         │               │          │
+    │   │ • Docker      │         │ • Docker      │          │
+    │   │ • ImgBuilder  │         │ • ImgBuilder  │          │
+    │   │ • Cleanup     │         │ • Cleanup     │          │
+    │   │               │         │               │          │
+    │   │  ┌───┐ ┌───┐  │         │  ┌───┐ ┌───┐  │          │
+    │   │  │WS1│ │WS2│  │         │  │WS3│ │WS4│  │          │
+    │   │  └───┘ └───┘  │         │  └───┘ └───┘  │          │
+    │   └───────────────┘         └───────────────┘          │
+    │                                                         │
+    └─────────────────────────────────────────────────────────┘
+
+    Disk Service
+         │
+         └──▶ Finds server with least disk usage
+              Returns to A4C for workspace placement

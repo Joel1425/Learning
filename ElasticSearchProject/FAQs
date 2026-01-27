@@ -1,0 +1,254 @@
+1. Why did you use POST to make search request?
+We use POST because our search requests have complex nested filters and pagination cursors that don't fit well in query parameters. This follows Elasticsearch's own API design. For simple lookups like GET /jobs/{id}, we use GET.
+
+2. How does the control flow happens?
+Control Flow: POST /api/v1/jobs/search
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SEARCH REQUEST CONTROL FLOW                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Step 1: Frontend sends request
+─────────────────────────────
+    ┌──────────────┐
+    │   Frontend   │
+    │  (Dashboard) │
+    └──────┬───────┘
+           │
+           │  POST /api/v1/jobs/search
+           │  {
+           │    "statuses": ["FAILED"],
+           │    "projectName": "backend-api",
+           │    "createdAfter": "2024-01-01T00:00:00Z",
+           │    "pageSize": 20
+           │  }
+           ▼
+
+Step 2: API Gateway
+───────────────────
+    ┌──────────────────────────────────────────┐
+    │             API Gateway                   │
+    │                                           │
+    │  1. Validate JWT token                    │
+    │  2. Check rate limit (200/min)            │
+    │  3. Route to backend service              │
+    └──────────────────┬───────────────────────┘
+                       │
+                       ▼
+
+Step 3: Controller receives request
+───────────────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                     JobSearchController                       │
+    │                                                               │
+    │  @PostMapping("/search")                                      │
+    │  public ResponseEntity<SearchResponse> search(                │
+    │      @Valid @RequestBody JobSearchRequest request,            │
+    │      @AuthenticationPrincipal UserDetails user) {             │
+    │                                                               │
+    │      // Extract user context from JWT                         │
+    │      request.setRequestingUserId(user.getUserId());           │
+    │                                                               │
+    │      // Delegate to service                                   │
+    │      SearchResponse response = searchService.search(request); │
+    │                                                               │
+    │      return ResponseEntity.ok(response);                      │
+    │  }                                                            │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 4: Service layer with fallback
+───────────────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                     JobSearchService                          │
+    │                                                               │
+    │  public SearchResponse search(JobSearchRequest request) {     │
+    │                                                               │
+    │      try {                                                    │
+    │          // PRIMARY PATH: Elasticsearch                       │
+    │          return searchElasticsearch(request);                 │
+    │                                                               │
+    │      } catch (ElasticsearchException e) {                     │
+    │          // FALLBACK PATH: PostgreSQL                         │
+    │          log.warn("ES failed, using PostgreSQL fallback");    │
+    │          metrics.increment("search.fallback");                │
+    │          return searchPostgres(request);                      │
+    │      }                                                        │
+    │  }                                                            │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 5: Build Elasticsearch query
+─────────────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                   JobSearchQueryBuilder                       │
+    │                                                               │
+    │  BoolQueryBuilder boolQuery = QueryBuilders.boolQuery();      │
+    │                                                               │
+    │  // Add status filter (OR within field)                       │
+    │  boolQuery.filter(                                            │
+    │      QueryBuilders.termsQuery("status", ["FAILED"])           │
+    │  );                                                           │
+    │                                                               │
+    │  // Add project filter                                        │
+    │  boolQuery.filter(                                            │
+    │      QueryBuilders.termQuery("projectName", "backend-api")    │
+    │  );                                                           │
+    │                                                               │
+    │  // Add date range filter                                     │
+    │  boolQuery.filter(                                            │
+    │      QueryBuilders.rangeQuery("createdAt")                    │
+    │          .gte("2024-01-01T00:00:00Z")                         │
+    │  );                                                           │
+    │                                                               │
+    │  // Build final query                                         │
+    │  NativeSearchQuery query = new NativeSearchQueryBuilder()     │
+    │      .withQuery(boolQuery)                                    │
+    │      .withSort(Sort.by(Direction.DESC, "createdAt"))          │
+    │      .withPageable(PageRequest.of(0, 20))                     │
+    │      .build();                                                │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 6: Execute query on Elasticsearch
+──────────────────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                      Elasticsearch                            │
+    │                                                               │
+    │  Received query:                                              │
+    │  {                                                            │
+    │    "query": {                                                 │
+    │      "bool": {                                                │
+    │        "filter": [                                            │
+    │          { "terms": { "status": ["FAILED"] } },               │
+    │          { "term": { "projectName": "backend-api" } },        │
+    │          { "range": { "createdAt": { "gte": "..." } } }       │
+    │        ]                                                      │
+    │      }                                                        │
+    │    },                                                         │
+    │    "sort": [{ "createdAt": "desc" }],                         │
+    │    "size": 20                                                 │
+    │  }                                                            │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 7: ES internal execution
+─────────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │              Elasticsearch Query Execution                    │
+    │                                                               │
+    │  Coordinating Node:                                           │
+    │  ├── Parse query                                              │
+    │  ├── Identify shards: [Shard0, Shard1, Shard2]               │
+    │  └── Fan out to all shards (parallel)                        │
+    │                                                               │
+    │       ┌─────────┐      ┌─────────┐      ┌─────────┐          │
+    │       │ Shard 0 │      │ Shard 1 │      │ Shard 2 │          │
+    │       │         │      │         │      │         │          │
+    │       │ 1.Check │      │ 1.Check │      │ 1.Check │          │
+    │       │  cache  │      │  cache  │      │  cache  │          │
+    │       │         │      │         │      │         │          │
+    │       │ 2.Query │      │ 2.Query │      │ 2.Query │          │
+    │       │ inverted│      │ inverted│      │ inverted│          │
+    │       │  index  │      │  index  │      │  index  │          │
+    │       │         │      │         │      │         │          │
+    │       │ 3.Return│      │ 3.Return│      │ 3.Return│          │
+    │       │  top 20 │      │  top 20 │      │  top 20 │          │
+    │       └────┬────┘      └────┬────┘      └────┬────┘          │
+    │            │                │                │               │
+    │            └────────────────┼────────────────┘               │
+    │                             ▼                                │
+    │  Coordinating Node:                                           │
+    │  ├── Merge results from all shards                           │
+    │  ├── Global sort by createdAt DESC                           │
+    │  ├── Take top 20                                             │
+    │  └── Fetch document _source                                  │
+    │                                                               │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 8: Map response to DTO
+───────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                   Response Mapping                            │
+    │                                                               │
+    │  SearchHits<JobDocument> hits = esOperations.search(query);   │
+    │                                                               │
+    │  List<JobDto> jobDtos = hits.getSearchHits().stream()         │
+    │      .map(hit -> {                                            │
+    │          JobDocument doc = hit.getContent();                  │
+    │          return JobDto.builder()                              │
+    │              .id(doc.getId())                                 │
+    │              .status(doc.getStatus())                         │
+    │              .projectName(doc.getProjectName())               │
+    │              .createdAt(doc.getCreatedAt())                   │
+    │              .build();                                        │
+    │      })                                                       │
+    │      .collect(toList());                                      │
+    │                                                               │
+    │  // Build pagination cursor from last hit                     │
+    │  List<Object> nextCursor = getLastHitSortValues(hits);        │
+    │                                                               │
+    │  return SearchResponse.builder()                              │
+    │      .total(hits.getTotalHits())                              │
+    │      .hits(jobDtos)                                           │
+    │      .nextCursor(nextCursor)                                  │
+    │      .build();                                                │
+    └──────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+
+Step 9: Return to frontend
+──────────────────────────
+    ┌──────────────────────────────────────────────────────────────┐
+    │                      HTTP Response                            │
+    │                                                               │
+    │  HTTP/1.1 200 OK                                              │
+    │  Content-Type: application/json                               │
+    │                                                               │
+    │  {                                                            │
+    │    "total": 45,                                               │
+    │    "hits": [                                                  │
+    │      {                                                        │
+    │        "id": "job-456",                                       │
+    │        "status": "FAILED",                                    │
+    │        "projectName": "backend-api",                          │
+    │        "hostname": "worker-03",                               │
+    │        "createdAt": "2024-01-15T10:25:00Z"                    │
+    │      },                                                       │
+    │      ...                                                      │
+    │    ],                                                         │
+    │    "nextCursor": [1705315500000, "job-456"]                   │
+    │  }                                                            │
+    └──────────────────────────────────────────────────────────────┘
+Sequence Diagram (Simplified)
+
+Frontend    Gateway    Controller    Service    QueryBuilder    Elasticsearch
+   │           │            │           │            │               │
+   │──POST────▶│            │           │            │               │
+   │           │──auth──────▶           │            │               │
+   │           │──forward───▶           │            │               │
+   │           │            │──search()─▶            │               │
+   │           │            │           │──build()───▶               │
+   │           │            │           │◀──query────│               │
+   │           │            │           │──────────────────search()─▶│
+   │           │            │           │            │               │
+   │           │            │           │            │    ┌──────────┤
+   │           │            │           │            │    │ Query    │
+   │           │            │           │            │    │ shards   │
+   │           │            │           │            │    │ Merge    │
+   │           │            │           │            │    └──────────┤
+   │           │            │           │            │               │
+   │           │            │           │◀─────────────────hits──────│
+   │           │            │           │──map to DTO│               │
+   │           │            │◀──response│            │               │
+   │           │◀───────────│           │            │               │
+   │◀──JSON────│            │           │            │               │
+
+
+3. 
