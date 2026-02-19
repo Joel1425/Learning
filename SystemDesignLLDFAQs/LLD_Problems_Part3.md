@@ -2024,9 +2024,299 @@ All 12 LLD problems have been implemented:
 | 10 | Online Shopping | Strategy, Factory, Service Layer |
 | 11 | Vending Machine | State Pattern |
 | 12 | Cab Booking | Strategy, Observer |
+| 13 | Amazon Locker | Information Expert, Orchestrator |
 
 Each implementation includes:
 - Proper class design following SOLID principles
 - Thread safety where applicable
 - Extensible architecture
 - Working demo code
+
+---
+
+## Problem 13: Amazon Locker System
+
+### What is Amazon Locker?
+
+```
+Self-service package pickup system:
+1. Driver deposits package → Gets access token
+2. Customer enters token → Retrieves package
+
+┌─────────────────────────────────────────────────────────┐
+│                    AMAZON LOCKER                         │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐      │
+│  │ S   │ │ S   │ │ M   │ │ M   │ │ L   │ │ L   │      │
+│  │     │ │ 📦  │ │     │ │ 📦  │ │     │ │     │      │
+│  └─────┘ └─────┘ └─────┘ └─────┘ └─────┘ └─────┘      │
+│  Small   Small   Medium  Medium   Large   Large        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Requirements
+
+```
+✅ In Scope:
+1. Deposit package by size (S/M/L) → Returns access token
+2. Pickup using access token → Opens compartment
+3. Access tokens expire after 7 days
+4. Staff can open all expired compartments
+5. Exact size match only (no fallback)
+
+❌ Out of Scope:
+- Delivery logistics
+- Notification (SMS/email)
+- Lockout after failed attempts
+- Multiple locker stations
+```
+
+### Core Entities
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Entity       │  Responsibility                            │
+├────────────────────────────────────────────────────────────┤
+│  Locker       │  Orchestrator. Owns compartments & tokens. │
+│               │  Handles deposit/pickup operations.        │
+│               │                                            │
+│  AccessToken  │  Bearer token with expiry. Maps to         │
+│               │  compartment. Enforces 7-day TTL.          │
+│               │                                            │
+│  Compartment  │  Physical slot. Has size (S/M/L).          │
+│               │  Tracks occupied state.                    │
+└────────────────────────────────────────────────────────────┘
+
+Why NOT a Package entity?
+→ Package is external to our system
+→ We only care about SIZE (input parameter)
+→ No behavior needed from Package
+```
+
+### Class Design
+
+```java
+class Locker {
+    - compartments: List<Compartment>
+    - accessTokenMapping: Map<String, AccessToken>
+
+    + depositPackage(Size size): String  // returns token code
+    + pickup(String tokenCode): void
+    + openExpiredCompartments(): void
+}
+
+class AccessToken {
+    - code: String
+    - expiration: Timestamp
+    - compartment: Compartment
+
+    + isExpired(): boolean
+    + getCompartment(): Compartment
+    + getCode(): String
+}
+
+class Compartment {
+    - size: Size
+    - occupied: boolean
+
+    + isOccupied(): boolean
+    + markOccupied(): void
+    + markFree(): void
+    + open(): void
+}
+
+enum Size { SMALL, MEDIUM, LARGE }
+```
+
+### Implementation
+
+```java
+// ============ LOCKER (Orchestrator) ============
+public class Locker {
+    private List<Compartment> compartments;
+    private Map<String, AccessToken> accessTokenMapping = new HashMap<>();
+
+    public Locker(List<Compartment> compartments) {
+        this.compartments = compartments;
+    }
+
+    public String depositPackage(Size size) {
+        Compartment compartment = getAvailableCompartment(size);
+        if (compartment == null) {
+            throw new RuntimeException("No available compartment of size " + size);
+        }
+
+        compartment.open();
+        compartment.markOccupied();
+
+        AccessToken token = generateAccessToken(compartment);
+        accessTokenMapping.put(token.getCode(), token);
+
+        return token.getCode();
+    }
+
+    public void pickup(String tokenCode) {
+        if (tokenCode == null || tokenCode.isEmpty()) {
+            throw new RuntimeException("Invalid access token code");
+        }
+
+        AccessToken token = accessTokenMapping.get(tokenCode);
+        if (token == null) {
+            throw new RuntimeException("Invalid access token code");
+        }
+
+        if (token.isExpired()) {
+            throw new RuntimeException("Access token has expired");
+        }
+
+        Compartment compartment = token.getCompartment();
+        compartment.open();
+        clearDeposit(token);
+    }
+
+    public void openExpiredCompartments() {
+        for (AccessToken token : accessTokenMapping.values()) {
+            if (token.isExpired()) {
+                token.getCompartment().open();
+            }
+        }
+        // Don't clearDeposit - staff must physically remove packages
+    }
+
+    private Compartment getAvailableCompartment(Size size) {
+        for (Compartment c : compartments) {
+            if (c.getSize() == size && !c.isOccupied()) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    private AccessToken generateAccessToken(Compartment compartment) {
+        String code = String.format("%06d", new Random().nextInt(999999));
+        Instant expiration = Instant.now().plus(7, ChronoUnit.DAYS);
+        return new AccessToken(code, expiration, compartment);
+    }
+
+    private void clearDeposit(AccessToken token) {
+        token.getCompartment().markFree();
+        accessTokenMapping.remove(token.getCode());
+    }
+}
+
+// ============ ACCESS TOKEN ============
+public class AccessToken {
+    private String code;
+    private Instant expiration;
+    private Compartment compartment;
+
+    public AccessToken(String code, Instant expiration, Compartment compartment) {
+        this.code = code;
+        this.expiration = expiration;
+        this.compartment = compartment;
+    }
+
+    public boolean isExpired() {
+        return Instant.now().isAfter(expiration);
+    }
+
+    public Compartment getCompartment() { return compartment; }
+    public String getCode() { return code; }
+}
+
+// ============ COMPARTMENT ============
+public class Compartment {
+    private Size size;
+    private boolean occupied = false;
+
+    public Compartment(Size size) {
+        this.size = size;
+    }
+
+    public Size getSize() { return size; }
+    public boolean isOccupied() { return occupied; }
+    public void markOccupied() { occupied = true; }
+    public void markFree() { occupied = false; }
+    public void open() { System.out.println("Compartment opened"); }
+}
+
+// ============ SIZE ENUM ============
+public enum Size { SMALL, MEDIUM, LARGE }
+```
+
+### Flow Visualization
+
+```
+DEPOSIT FLOW:
+Driver: "I have MEDIUM package"
+         │
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│ 1. Find available MEDIUM compartment                    │
+│ 2. compartment.open() → Door unlocks                   │
+│ 3. compartment.markOccupied()                          │
+│ 4. Generate token "ABC123" (expires in 7 days)         │
+│ 5. Store in accessTokenMapping                          │
+│ 6. Return "ABC123" to driver                           │
+└─────────────────────────────────────────────────────────┘
+
+PICKUP FLOW:
+Customer: "My code is ABC123"
+         │
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│ 1. Lookup "ABC123" in accessTokenMapping               │
+│ 2. Check isExpired() → false ✓                         │
+│ 3. compartment.open() → Door unlocks                   │
+│ 4. compartment.markFree()                              │
+│ 5. Remove token from mapping                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Common Extensions
+
+**1. Size Fallback (Small → Medium → Large):**
+```java
+private Compartment getAvailableCompartment(Size requestedSize) {
+    Size[] sizes = {Size.SMALL, Size.MEDIUM, Size.LARGE};
+    int startIndex = Arrays.asList(sizes).indexOf(requestedSize);
+
+    for (int i = startIndex; i < sizes.length; i++) {
+        for (Compartment c : compartments) {
+            if (c.getSize() == sizes[i] && !c.isOccupied()) {
+                return c;
+            }
+        }
+    }
+    return null;
+}
+```
+
+**2. Maintenance Status:**
+```java
+enum CompartmentStatus { AVAILABLE, OCCUPIED, OUT_OF_SERVICE }
+
+class Compartment {
+    private CompartmentStatus status = CompartmentStatus.AVAILABLE;
+
+    public boolean isAvailable() {
+        return status == CompartmentStatus.AVAILABLE;
+    }
+}
+```
+
+**3. Two-Phase Deposit:**
+```java
+// Split into reserve + confirm
+public String reserveCompartment(Size size);  // Opens door, returns reservationId
+public String confirmDeposit(String reservationId);  // Returns token after driver confirms
+```
+
+### Interview Expectations
+
+| Level | What's Expected |
+|-------|-----------------|
+| Junior | Identify core entities, implement happy path |
+| Mid | Clean 3-class design, handle edge cases (invalid/expired tokens) |
+| Senior | Drive design, discuss tradeoffs, anticipate extensions |
+
+**Interview one-liner:** *"Amazon Locker uses 3 entities: Locker (orchestrator), AccessToken (bearer token with TTL), Compartment (physical slot). Compartment owns physical state (occupied), Locker owns relational state (token mapping). Key: deposit opens door + generates token, pickup validates + opens + cleans up."*

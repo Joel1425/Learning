@@ -87,7 +87,7 @@ How do you make the system highly available (avoid SPOF)?
 
 
 
-What is DB is down?
+What if DB is down?
 
 -> We have a Primary/replicas architecture, so the writes are propagated using WAL asynchronously to all the replicas.  
 

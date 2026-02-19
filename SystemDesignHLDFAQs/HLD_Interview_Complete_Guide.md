@@ -2292,4 +2292,179 @@ Framework for Comparison:
 
 ---
 
+## 12. Session Q&A Notes
+
+### Q1: How does PostGIS work? How is lat/long indexed? Does it use GeoHash?
+
+**Answer:** PostGIS uses **R-Tree indexes (via GiST)**, NOT GeoHash by default.
+
+**R-Tree vs GeoHash:**
+
+| Aspect | R-Tree (PostGIS) | GeoHash |
+|--------|------------------|---------|
+| Structure | Hierarchical bounding boxes | String encoding ("tdr1y") |
+| Nearest neighbor | Excellent (native) | Needs workarounds |
+| Use case | Complex spatial queries | Redis, DynamoDB, simple proximity |
+
+**Example:**
+```sql
+CREATE INDEX idx_location ON restaurants USING GIST(location);
+
+SELECT name FROM restaurants
+WHERE ST_DWithin(location, ST_MakePoint(77.59, 12.97)::geography, 5000);
+```
+
+---
+
+### Q2: How does R-Tree work? How does it handle points in different boxes but close to user?
+
+**Core Concept:** R-Tree groups nearby points into bounding boxes, then groups boxes into larger boxes (hierarchical).
+
+**The Edge Case Problem:**
+```
+┌─────────────────┬─────────────────┐
+│     Box A       │      Box B      │
+│                 │  ☕ Coffee Shop │
+│         📍 USER │  (in Box B but  │
+│    (in Box A)   │   CLOSER!)      │
+└─────────────────┴─────────────────┘
+```
+
+**Solution:** R-Tree searches ALL boxes that OVERLAP with search radius, not just user's box:
+
+```
+┌─────────────────┬─────────────────┐
+│     Box A       │      Box B      │
+│            ┌────┼────┐            │
+│         📍─│─search──│ ☕ ← FOUND!│
+│            │ circle  │            │
+│            └────┼────┘            │
+└─────────────────┴─────────────────┘
+Search circle overlaps BOTH boxes → checks BOTH → finds ☕
+```
+
+**Recursion Steps:**
+```
+search(node, user, radius):
+  if node is leaf:
+      return points where distance(point, user) <= radius
+  else:
+      results = []
+      for each child_box in node:
+          if circle_overlaps_box(user, radius, child_box):
+              results += search(child_box, user, radius)  ← RECURSIVE
+      return results
+```
+
+**Overlap Check:**
+```python
+def circle_overlaps_box(user, radius, box):
+    closest_x = clamp(user.x, box.min_x, box.max_x)
+    closest_y = clamp(user.y, box.min_y, box.max_y)
+    distance = sqrt((user.x - closest_x)² + (user.y - closest_y)²)
+    return distance <= radius
+```
+
+**Interview one-liner:** *"R-Tree searches all bounding boxes overlapping the query circle, not just the user's box. This handles edge cases where nearby points are in adjacent boxes. Time complexity is O(log n) average."*
+
+---
+
+### Q3: SQL vs Graph DB for Many-to-Many (Friends of Friends)
+
+**The Schema (Many-to-Many in SQL):**
+```
+users:                    friendships (junction table):
+┌─────┬─────────┐        ┌─────────┬───────────┐
+│ id  │ name    │        │ user_id │ friend_id │
+├─────┼─────────┤        ├─────────┼───────────┤
+│ 123 │ Alice   │        │ 123     │ 456       │
+│ 456 │ Bob     │        │ 123     │ 789       │
+│ 789 │ Carol   │        │ 456     │ 999       │
+└─────┴─────────┘        └─────────┴───────────┘
+
+Visual:
+        Alice (123)
+        /         \
+     Bob (456)   Carol (789)
+     /    \           \
+  Dave    Eve        Frank
+```
+
+**SQL Query for Friends-of-Friends:**
+```sql
+SELECT * FROM users u1
+JOIN friendships f1 ON u1.id = f1.user_id      -- Alice's friends
+JOIN friendships f2 ON f1.friend_id = f2.user_id  -- Their friends
+JOIN users u2 ON f2.friend_id = u2.id
+WHERE u1.id = 123 AND u2.id != 123;
+```
+
+**Why SQL is Inefficient:**
+```
+Depth 1: 1 JOIN  → O(n)
+Depth 2: 2 JOINs → O(n²)
+Depth 6: 6 JOINs → O(n⁶) 💀
+Each JOIN = full table scan × previous results
+```
+
+---
+
+### Q4: How do Graph DBs Work?
+
+**Key Concept: Index-Free Adjacency**
+
+```
+SQL: Relationships in separate table (requires JOIN)
+┌───────┐     ┌─────────────────┐
+│ Alice │ ──? │ friendships tbl │  → Must scan/index!
+└───────┘     └─────────────────┘
+
+Graph DB: Direct pointers stored in node
+┌───────┐
+│ Alice │──ptr──→ Bob
+│       │──ptr──→ Carol    → Just follow pointer!
+└───────┘
+```
+
+**Graph Node Structure:**
+```
+┌─────────────────────────────────────────┐
+│ Node: Alice                             │
+├─────────────────────────────────────────┤
+│ id: 123                                 │
+│ labels: [:User]                         │
+│ properties: {name: "Alice", age: 28}    │
+│ relationships: [ptr→Bob, ptr→Carol]    │ ← DIRECT POINTERS
+└─────────────────────────────────────────┘
+```
+
+**Cypher Query (Graph DB):**
+```cypher
+MATCH (me:User {id: 123})-[:FRIEND*2..3]-(fof:User)
+RETURN DISTINCT fof;
+
+-- Breakdown:
+-- (me:User {id: 123})  → Start at Alice
+-- [:FRIEND*2..3]       → Follow FRIEND edges 2-3 hops
+-- (fof:User)           → Return reached users
+```
+
+**Performance Comparison:**
+
+| Query Depth | SQL (1M users) | Graph DB |
+|-------------|----------------|----------|
+| 2 hops | ~100ms | ~2ms |
+| 4 hops | ~10sec | ~10ms |
+| 6 hops | Timeout | ~50ms |
+
+**When to Use:**
+```
+Graph DB: Social networks, recommendations, fraud detection
+SQL: Simple CRUD, aggregations, tabular reports
+```
+
+**Interview one-liner:** *"Graph DBs use index-free adjacency - nodes store direct pointers to neighbors. Traversal is O(relationships traversed) not O(data size), making multi-hop queries constant time regardless of total users."*
+
+---
+
 *This guide covers the most common HLD interview topics. Practice explaining each concept out loud, as if you're in an interview. Good luck!*
